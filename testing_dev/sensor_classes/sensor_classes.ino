@@ -1,8 +1,10 @@
-#include "soar_imu.h"
-SOAR_IMU imu_sensor;
+#include "soar_barometer.h"
+SOAR_BAROMETER bmu;
 void setup(){
-  Serial.begin(9600);
-  imu_sensor.BNO_SETUP();
+   Serial.begin(115200);
+
+  bmu.Initialize();
+
 }
 void loop(){
   float* accel = imu_sensor.GET_ACCELERATION();
