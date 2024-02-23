@@ -6,15 +6,14 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include "buzzer_notify.h"
+#include "MyVL53L0X.h"
 
 //TODO: Get rid of whatever this library is doing
-#include "Adafruit_BMP3XX.h"
 #include <HardwareSerial.h>
+#include "soar_barometer.h"
 #include "DCMotor.h"
 #include "ota_update.h"
-
-#define RX -1
-#define TX -1
+#include "SOAR_Lora.h"
 
 #define DEBUG_ALT false
 #define DEBUG_BUZZ false
@@ -31,9 +30,11 @@
 #define SEALEVELPRESSURE_HPA (1013.25)
 float altimeter_latest;
 int ALT_TRSH_CHECK=850; // Use -10 for parking lot test and maybe change it on location
+int LOW_ALT_TRSH_CHECK=300;
 
 OTA_Update otaUpdater("soar-deploy", "TP-Link_BCBD", "10673881");
 
+SOAR_Lora lora("5", "5", "433000000"); // LoRa
 
 //STEPPER MOTOR DELAYS
 static const int microDelay = 900;
@@ -42,55 +43,14 @@ static const int betweenDelay = 250;
 //DC motor
 DCMotor motor(A2, 50, 50);
 
-//LORA Variables and Objects
-HardwareSerial Lora(0);
-String output = "IDLE";
-
-
-Adafruit_BMP3XX bmp;
-void bmp_setup()
-{
-  Wire.begin();
-  if (!bmp.begin_I2C())
-  { // hardware I2C mode, can pass in address & alt Wire
-    // if (! bmp.begin_SPI(BMP_CS)) {  // hardware SPI mode
-    // if (! bmp.begin_SPI(BMP_CS, BMP_SCK, BMP_MISO, BMP_MOSI)) {  // software SPI mode
-    Serial.println("Could not find a valid BMP3 sensor, check wiring!");
-    Serial.println("Sensor setup error");
-    return;
-  }
-
-  // Set up oversampling and filter initialization
-  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
-  bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
-  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
-  bmp.setOutputDataRate(BMP3_ODR_50_HZ);
-}
-int bmp_fail = 0;
-float GetAltitude()
-{
-  if (!bmp.performReading())
-  {
-    Serial.println("Failed to perform reading");
-    bmp_fail++;
-    if (bmp_fail > 10)
-    {
-      bmp_fail = 0;
-      bmp_setup();
-      delay(100);
-    }
-    // Attempt to reconnect to the sensor
-    return 0;
-  }
-  bmp_fail = 0;
-  return bmp.readAltitude(SEALEVELPRESSURE_HPA);
-}
+SOAR_BAROMETER barometer;
 
 float previous_altitude = -300;
 float max_candidate = -300;
 int alt_trigger_count = 0;
+int low_alt_trigger_count = 0;
 float immediate_previous = -6000;
-bool altitudeTrigger(float current_altitude)
+int altitudeTrigger(float current_altitude)
 {
 #if DEBUG_ALT
   Serial.print("Dif:");
@@ -98,154 +58,174 @@ bool altitudeTrigger(float current_altitude)
   Serial.print("Prev:");
   Serial.println(previous_altitude);
 #endif
-  bool res = false;
-  // Check if the altitude is decreasing and above 30.48 meters
+  int res = 0;
+  // Check if the altitude is decreasing and above ALT_TRSH_CHECK
   if ((current_altitude > ALT_TRSH_CHECK) && (current_altitude - previous_altitude < -2))
   {
-    res = true;
+    res = 1;
   }
   if (current_altitude > previous_altitude)
     if (current_altitude - immediate_previous < 800 || immediate_previous == -60000)
     { // Default value for errors
       previous_altitude = current_altitude;
     }
-  if (current_altitude - immediate_previous > 800)
-    res = false;
-  immediate_previous = current_altitude;
-  return res; // NOTRIGGER
+  if (current_altitude - immediate_previous > 800)//If altitude shows sudden changes it must be a glitch
+    res = 0;
   // Update previous_altitude for the next function call
+  immediate_previous = current_altitude;
+  return res;
 }
 
 
 
 BuzzerNotify buzzerNotify = BuzzerNotify(buzzerPin);
 
+MyVL53L0X distanceSensor;
+
 class Deployment
 {
 private:
-  bool _started = false;
-  bool _active = false;
-  bool _forward = false;
-  bool _nimble = false;
-  bool _retract = false;
+  int _state = 0; // _standby = 0; _forward = 1; _wait = 2; _retract = 3; _complete = 4;  _paused = 5;
+  const char *message[6]={"STANDBY", "FORWARD", "WAITING", "RETRACTING", "COMPLETED", "PAUSED"};
+  bool sensor_trigger = false;
+  uint32_t _forward_checkpoint = 0;
+  uint32_t _wait_checkpoint = 0;
+  uint32_t _retract_checkpoint = 0;
   uint32_t _last_checkpoint = 0;
-  uint32_t _move_duration = 10000;   // 43 seconds
-  uint32_t _reset_duration = 10000;  // Around half of move duration
-  uint32_t _nimble_duration = 10000; // 10 seconds
+  uint32_t _forward_duration = 3500;   // 43 seconds
+  uint32_t _retract_duration = 8000;  // Around half of move duration
+  uint32_t _wait_duration = 60000; // 10 seconds
+  int last_state = 0;
+  bool _warn = false;
+  int  fwd_sensor_checks = 0;
+  int retract_sensor_checks = 0;
 public:
   Deployment(){};
-  void TriggerProcedure()
+
+  void Deploy()
   {
-    if (!_active)
+    if (_state==0)
     {
-      _active = true;
-      _last_checkpoint = millis();
+      _state = 1;
+    }
+    if(_state==5){
+      _state=last_state;
+      switch (last_state){
+        case 1:
+          _forward_checkpoint=millis();
+          break;
+        case 2:
+          _wait_checkpoint=millis();
+          break;
+        case 3:
+          _retract_checkpoint=millis();
+          break;
+      }
     }
   };
+
   void Stop()
   {
-    _active = false;
+    last_state=_state;
+    _state = 5;
     motor.DC_STOP();
   };
+
   void ProcedureCheck()
   {
-    if (!_active)
-      return;
-    const uint32_t curr_duration = millis() - _last_checkpoint;
-    if (!_forward && curr_duration < _move_duration)
-    {
-      Serial.println("Deploying forward...");
-      motor.DC_MOVE(50);
-    }
-    else if (!_forward && curr_duration >= _move_duration)
-    {
-      Serial.println("Stopping forward deploy");
-      _forward = true;
-      _last_checkpoint = millis();
-    }
-    else if (_forward && !_nimble && curr_duration < _nimble_duration)
-    {
-      Serial.println("Allowing time to deploy...");
-      motor.DC_STOP();
-    }
-    else if (_forward && !_nimble && curr_duration >= _nimble_duration)
-    {
-      Serial.println("Triggering retract");
-      _nimble = true;
-      _last_checkpoint = millis();
-    }
-    else if (_forward && _nimble && !_retract && curr_duration < _move_duration)
-    {
-      Serial.println("Retracting back");
-      motor.DC_MOVE(-50);
-    }
-    else if (_forward && _nimble && !_retract && curr_duration > _reset_duration)
-    {
-      Serial.println("Retracting completed");
-      motor.DC_STOP();
-      _retract = true;
-    }
-    if (_forward && _nimble && _retract)
-    {
-      _active = false;
+    uint16_t distance;
+    switch (_state){
+      case 0://standby
+        break;
+      case 1://forward
+        if(_forward_checkpoint==0){
+          GetStatus();
+          for(int i=0; i<5; i++){
+            buzzerNotify.Trigger();
+            delay(100);
+          }
+          _forward_checkpoint=millis();
+        }
+        //Sensor and time logic comes first
+        distance = distanceSensor.readDistance();
+        Serial.println(distance);
+        sensor_trigger = distance>500;
+        if(sensor_trigger) fwd_sensor_checks++;
+        else fwd_sensor_checks = 0;
+        if(fwd_sensor_checks>3 || (millis()-_forward_checkpoint)>_forward_duration){
+          if(sensor_trigger){
+            Serial.println("Stop triggered by sensor");
+          }
+          Serial.println("Stopped.");
+          motor.DC_STOP();
+          _state=2;
+        }
+        else{
+          // Move forward logic comes second
+          motor.DC_MOVE(50);
+        }
+        break;
+      case 2://wait
+        if(_wait_checkpoint==0){
+          GetStatus();
+          _wait_checkpoint=millis();
+        }
+        motor.DC_STOP();
+        if((millis()-_wait_checkpoint)>_wait_duration){
+          _state=3;
+        }
+        break;
+      case 3://retract
+        if(_retract_checkpoint==0){
+          GetStatus();
+          for(int i=0; i<5; i++){
+            buzzerNotify.Trigger();
+            delay(100);
+          }
+          _retract_checkpoint=millis();
+        }
+        //Sensor and time logic comes first
+        distance = distanceSensor.readDistance();
+        Serial.println(distance);
+        sensor_trigger = distance<90;
+        if(sensor_trigger) retract_sensor_checks++;
+        else retract_sensor_checks = 0;
+        if(retract_sensor_checks>3 || (millis()-_retract_checkpoint)>_retract_duration){
+          if(sensor_trigger){
+            Serial.println("Stop triggered by sensor");
+          }
+          Serial.println("Stopped.");
+          motor.DC_STOP();
+          _state=4;
+        }
+        else{
+          // Move back logic comes second
+          motor.DC_MOVE(-50);
+        }
+        break;
+      case 4://complete
+        motor.DC_STOP();
+        break;
+      case 5://paused
+        motor.DC_STOP();
+        break;
     }
   };
   void Reset()
   {
-    _forward = false;
-    _nimble = false;
-    _retract = false;
-    _last_checkpoint = 0;
-    _active = false;
+    _state = 0;
+    _forward_checkpoint = 0;
+    _wait_checkpoint = 0;
+    _retract_checkpoint = 0;
+    _warn=false;
   };
   void Retract()
   {
-    _forward = true;
-    _nimble = true;
-    _retract = false;
-    _last_checkpoint = millis();
-    _active = true;
+    if(_state==0 || _state==2) _state=3;
   }
   String GetStatus()
   {
-    if (_active)
-    {
-      if (!_forward && !_nimble && !_retract)
-      {
-        return "EXTENDING";
-      }
-      else if (_forward && !_nimble && !_retract)
-      {
-        return "WAITING";
-      }
-      else if (_forward && _nimble && !_retract)
-      {
-        return "RETRACTING";
-      }
-      else if (_forward && _nimble && _retract)
-      {
-        return "COMPLETED";
-      }
-      else
-      {
-        return "PAUSED";
-      }
-    }
-    else
-    {
-      if (_forward && _nimble && _retract)
-      {
-        return "COMPLETED";
-      }
-      else if (_forward || _nimble || _retract)
-      {
-        return "PAUSED";
-      }
-      else
-      {
-        return "IDLE";
-      }
-    }
+    return message[_state];
   };
 };
 Deployment deployment;
@@ -285,7 +265,7 @@ class MyCallbacks : public BLECharacteristicCallbacks
         pCharacteristic->setValue("OK");
         pCharacteristic->notify();
         Serial.println("Deploy procedure\n");
-        deployment.TriggerProcedure();
+        deployment.Deploy();
       }
       else if (value_str == "STOP")
       {
@@ -317,84 +297,14 @@ class MyCallbacks : public BLECharacteristicCallbacks
       } else if(value_str == "STATUS") {
           String  sts  = deployment.GetStatus();
           String stat = "DEPLOY-STATUS:"+ sts;
-          // pCharacteristic->setValue(stat);
-        // pCharacteristic->notify();
-        // Serial.println("Rtracting deployment\n");
-
+          std::string stat_std = stat.c_str(); // Convert Arduino String to std::string
+          pCharacteristic->setValue(stat_std); // Set the value using std::string
       }
     }
   }
 };
 
-void LoraSend(const char *toSend, unsigned long milliseconds = 500)
-{
-  for (int i = 0; i < 3; i++)
-  {
-    String res = sendATcommand(toSend, milliseconds);
-    Serial.println(res);
-    if (res.indexOf("+ERR") >= 0)
-    {
-      Serial.println("Err response detected. Retrying...");
-    }
-    else
-    {
-      break;
-    }
-  }
-}
-String sendATcommand(const char *toSend, unsigned long milliseconds)
-{
-  String result;
-  Serial.print("Sending: ");
-  Serial.println(toSend);
-  Lora.println(toSend);
-  unsigned long startTime = millis();
-  Serial.print("Received: ");
-  while (millis() - startTime < milliseconds)
-  {
-    if (Lora.available())
-    {
-      char c = Lora.read();
-      Serial.write(c);
-      result += c; // append to the result string
-    }
-  }
-  Serial.println(); // new line after timeout.
-  return result;
-}
 
-void send_command(String inputString)
-{
-  int len = inputString.length();
-  Serial.println(inputString);
-  char returnedStr[len];
-  inputString.toCharArray(returnedStr, len + 1);
-  Serial.println(returnedStr);
-  if (len <= 9)
-  {
-    char tempArray[12 + len];
-    sprintf(tempArray, "AT+SEND=1,%d,", len);
-    strcat(tempArray, returnedStr);
-    Serial.println(tempArray);
-    LoraSend(tempArray, 500);
-  }
-  else if (len > 9 && len <= 99)
-  {
-    char tempArray[13 + len];
-    sprintf(tempArray, "AT+SEND=1,%d,", len);
-    strcat(tempArray, returnedStr);
-    Serial.println(tempArray);
-    LoraSend(tempArray, 500);
-  }
-  else
-  {
-    char tempArray[14 + len];
-    sprintf(tempArray, "AT+SEND=1,%d,", len);
-    strcat(tempArray, returnedStr);
-    Serial.println(tempArray);
-    LoraSend(tempArray, 500);
-  }
-}
 
 void setup()
 {
@@ -407,13 +317,9 @@ deployment.Retract();
 #endif
 #endif
   Serial.begin(115200);
-
+  Wire.begin();
   //LORA SETUP
-  Lora.begin(115200, SERIAL_8N1, RX, TX);
-
-  LoraSend("AT+ADDRESS=5", 500);
-  LoraSend("AT+BAND=905000000", 500);
-  LoraSend("AT+NETWORKID=5", 500);
+  lora.begin();
 
   buzzerNotify.Setup();
   // Stepper setup------------------
@@ -441,13 +347,18 @@ deployment.Retract();
   pServer->getAdvertising()->start();
   Serial.println("Waiting a client connection to notify...");
   buzzerNotify.Trigger();
-  bmp_setup();
+  barometer.Initialize();
   buzzerNotify.Trigger();
   motor.DC_SETUP();
   buzzerNotify.Trigger();
 
   otaUpdater.Setup();
 
+  //Distance sensor setup
+  
+  distanceSensor.begin();
+  delay(500);
+  lora.sendCommand("AWAKE");
 }
 
 void loop()
@@ -469,76 +380,77 @@ void loop()
   }
 
   // Automated Altitude Trigger Check
-  float altitude = GetAltitude();
+  float altitude = barometer.get_last_altitude_reading();
   altimeter_latest = altitude;
 #if DEBUG_ALT
   Serial.print("Altitude: ");
   Serial.println(altitude);
 #endif
 
-  bool descending = altitudeTrigger(altitude);
-  if (descending)
+  int descending = altitudeTrigger(altitude);
+  if (descending==1)
   {
     if (alt_trigger_count > 5)
     { // Must make sure that the trigger is not a false positive
       Serial.println("Triggering deployment");
-      deployment.TriggerProcedure();
+      deployment.Deploy();
     }
     else
     {
       alt_trigger_count++; // This must be protected under else to prevent overflow
     }
   }
+  else if(descending==2){
+    if(low_alt_trigger_count>5){
+      Serial.println("Low altitude detected");
+      if(deployment.GetStatus()=="FORWARD"){ //In case we haven't finished extended by the time we reach the lower altitude
+        deployment.Stop();
+        deployment.Reset();
+      }
+      deployment.Retract();
+    } else {
+      low_alt_trigger_count++;
+    }
+  }
+  
 
   // Deployment Procedure Constant Check
   deployment.ProcedureCheck();
 
-  if (Lora.available())
+  if (lora.available())
   {
     String incomingString = "";
     Serial.print("Request Received: ");
-    incomingString = Lora.readString();
-    delay(50);
-    char dataArray[incomingString.length()];
-    incomingString.toCharArray(dataArray, incomingString.length());
-    char *data = strtok(dataArray, ",");
-    data = strtok(NULL, ",");
-    data = strtok(NULL, ",");
-    Serial.println(data);
-    String data_str = String(data);
+    String data_str = lora.read();
     if (data_str == "PING")
     {
-      send_command("PONG");
+      lora.queueCommand("PONG");
     }
-    if (data_str == "DEPLOY")
+    else if (data_str == "DEPLOY")
     {
-      output = "DEPLOY";
       Serial.println("Deployment Triggered");
-      deployment.TriggerProcedure();
-      send_command("DEPLOY:TRIGGERING");
+      deployment.Deploy();
+      lora.queueCommand("DEPLOY:TRIGGERING");
     }
     else if (data_str == "STOP")
     {
-      output = "STOP";
       deployment.Stop();
-      send_command("DEPLOY:STOPING");
+      lora.queueCommand("DEPLOY:STOPING");
     }
     else if (data_str == "RESET")
     {
-      output = "RESET";
       deployment.Reset();
-      send_command("DEPLOY:RESETING");
+      lora.queueCommand("DEPLOY:RESETING");
     }
     else if (data_str == "STATUS")
     {
       String stat = "DEPLOY-STATUS:" + deployment.GetStatus();
-      send_command(stat);
+      lora.queueCommand(stat);
     }
     else if (data_str == "RETRACT")
     {
-      output = "RETRACT";
       deployment.Retract();
-      send_command("DEPLOY:RETRACTING");
+      lora.queueCommand("DEPLOY:RETRACTING");
     }
     else if (data_str == "ALTITUDE")
     {
@@ -546,7 +458,15 @@ void loop()
       dtostrf(altimeter_latest, 4, 2, altimeter_latest_str);
       char altitude_str[100] = "ALTITUDE:";
       strcat(altitude_str, altimeter_latest_str);
-      send_command(altitude_str);
+      lora.queueCommand(altitude_str);
+    }
+    else if (data_str == "DISTANCE")
+    {
+      char distance_data[5];
+      sprintf(distance_data, "%u", distanceSensor.readDistance());
+      char distance_str[100] = "DISTANCE:";
+      strcat(distance_str, distance_data);
+      lora.queueCommand(distance_str);
     }
     else if (data_str.indexOf("THRESHOLD") >= 0)
     {
@@ -566,20 +486,20 @@ void loop()
         Serial.print("New Trsh: ");
         Serial.println(ALT_TRSH_CHECK);
 #endif
-        send_command("THRESHOLD:SET");
+        lora.queueCommand("THRESHOLD:SET");
       }
       catch (String error)
       {
-        send_command("THRESHOLD:ERROR");
+        lora.queueCommand("THRESHOLD:ERROR");
       }
     }
     else
     {
-      output = data_str;
-      send_command("INVALID");
+      lora.queueCommand("INVALID");
     }
   }
   // Vital Sign Indicator
+  lora.handleQueue();
   buzzerNotify.Check();
   otaUpdater.Handle();
 }
